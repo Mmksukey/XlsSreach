@@ -8,7 +8,7 @@ import pandas as pd
 
 # -------------------- Config --------------------
 UPLOAD_DIR = "uploads"
-ALLOWED_EXT = {".xlsx", ".xls", ".csv"}
+ALLOWED_EXT = {".xlsx", ".xls", ".csv", ".txt"}  # เพิ่ม .txt
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
@@ -21,6 +21,32 @@ DATASTORE: List[Dict[str, Any]] = []
 # -------------------- Utils --------------------
 def ext_of(filename: str) -> str:
     return os.path.splitext(filename)[1].lower()
+
+
+def _load_txt_as_dataframe(path: str, filename: str) -> Dict[str, Any]:
+    """
+    อ่านไฟล์ .txt แล้วแปลงเป็น DataFrame หนึ่งคอลัมน์ชื่อ 'text'
+    บรรทัดละ 1 แถว เพื่อให้ search pipeline เดิมทำงานได้ทันที
+    """
+    encodings = ("utf-8", "utf-8-sig", "cp874", "iso-8859-11", "cp1252")
+    with open(path, "rb") as f:
+        raw = f.read()
+    text = None
+    for enc in encodings:
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode("utf-8", errors="replace")
+    # normalize newlines
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # ถ้าไม่อยากเก็บบรรทัดว่าง คอมเมนต์บรรทัดด้านล่างออก
+    # lines = [ln for ln in lines if ln.strip()]
+    df = pd.DataFrame({"text": lines})
+    return {"filename": filename, "sheet": "-", "df": df, "path": path}
+
 
 def load_dataframe_from_file(path: str, filename: str) -> Dict[str, Any]:
     ext = ext_of(filename)
@@ -45,8 +71,12 @@ def load_dataframe_from_file(path: str, filename: str) -> Dict[str, Any]:
         except UnicodeDecodeError:
             df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
         return {"filename": filename, "sheet": "-", "df": df, "path": path}
+    elif ext == ".txt":
+        # โหลด .txt เป็น DataFrame หนึ่งคอลัมน์ชื่อ 'text'
+        return _load_txt_as_dataframe(path, filename)
     else:
         raise ValueError("นามสกุลไฟล์ไม่รองรับ")
+
 
 def search_in_datastore(keyword: str) -> List[Dict[str, Any]]:
     """
@@ -74,28 +104,19 @@ def search_in_datastore(keyword: str) -> List[Dict[str, Any]]:
 
         # ค้นหาทีละคอลัมน์
         for c in text_cols:
-            mask = df_str[c].str.contains(kw, case=False, regex=False, na=False)
-            idxs = df.index[mask].tolist()
+            mask = df_str[c].str.contains(kw, case=False, na=False)
+            idxs = df_str.index[mask].tolist()
             for idx in idxs:
+                # excel_row: header อยู่แถว 1, ข้อมูลเริ่มแถว 2
+                excel_row = idx + 2
+                data_row = idx + 1
                 val = df_str.at[idx, c]
-                # คำนวณหมายเลขแถวแบบ Excel: header = 1, data row แรก = 2
-                # ถ้า index เป็น 0..N-1 ก็ใช้ idx + 2 ได้เลย
-                try:
-                    excel_row = int(idx) + 2
-                    data_row = int(idx) + 1
-                except Exception:
-                    # ถ้าเป็น index แบบ label แปลกๆ รีเซ็ตนับเอง
-                    # หาอันดับที่เท่าไหร่ในตำแหน่งที่แมตช์
-                    pos = mask[mask].index.get_loc(idx) if hasattr(mask.index, "get_loc") else 0
-                    excel_row = pos + 2
-                    data_row = pos + 1
-
                 results.append({
                     "filename": item["filename"],
                     "sheet": item["sheet"],
                     "excel_row": excel_row,
                     "data_row": data_row,
-                    "column": str(c),
+                    "column": c,
                     "value": val
                 })
     return results
@@ -129,9 +150,9 @@ INDEX_HTML = """
 </head>
 <body>
   <header>
-    <h1>🔎 ค้นหาชื่อใน Excel/CSV</h1>
+    <h1>ค้นหาชื่อในไฟล์ Excel/CSV/TXT</h1>
     <form action="{{ url_for('clear') }}" method="post">
-      <button type="submit" title="ล้างรายการไฟล์ทั้งหมด">ล้างไฟล์ทั้งหมด</button>
+      <button type="submit">ล้างไฟล์ทั้งหมด</button>
     </form>
   </header>
 
@@ -144,33 +165,32 @@ INDEX_HTML = """
   {% endwith %}
 
   <div class="card">
-    <h3>1) อัปโหลดไฟล์ (.xlsx / .csv) จะอัปหลายไฟล์ก็ได้</h3>
+    <h3>อัปโหลดไฟล์ (.xlsx, .xls, .csv, .txt)</h3>
     <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
-      <input type="file" name="files" multiple accept=".xlsx,.xls,.csv" required>
+      <input type="file" name="file" required>
       <button type="submit">อัปโหลด</button>
+      <p class="muted">ไฟล์จะถูกเก็บในเครื่องเพื่อค้นหา และคงอยู่จนกว่าจะกดล้าง</p>
     </form>
-    <p class="muted">ไฟล์ที่รองรับหลัก: .xlsx, .csv  ถ้า .xls ต้องติดตั้ง xlrd เพิ่ม</p>
   </div>
 
   <div class="card">
-    <h3>2) ค้นหา</h3>
-    <form action="{{ url_for('search') }}" method="post" class="row">
+    <h3>ค้นหา</h3>
+    <form action="{{ url_for('index') }}" method="get" class="row">
       <div class="col">
-        <label>คำค้นหา</label>
-        <input type="text" name="q" placeholder="พิมพ์ชื่อหรือบางส่วนของชื่อ" required>
+        <input type="text" name="q" placeholder="พิมพ์คำที่ต้องการค้นหา" value="{{ query or '' }}">
       </div>
-      <div class="col" style="align-self:flex-end">
+      <div class="col">
         <button type="submit">ค้นหา</button>
       </div>
     </form>
   </div>
 
   <div class="card">
-    <h3>ไฟล์ที่อัปโหลดแล้ว ({{ files|length }} ไฟล์)</h3>
+    <h3>ไฟล์ที่มีในระบบ</h3>
     {% if files %}
       <ul class="files">
         {% for f in files %}
-          <li>• {{ f.filename }}{% if f.sheet and f.sheet != '-' %} (ชีต: {{ f.sheet }}){% endif %}</li>
+          <li>{{ f }}</li>
         {% endfor %}
       </ul>
     {% else %}
@@ -210,61 +230,50 @@ INDEX_HTML = """
 </html>
 """
 
-@app.route("/", methods=["GET"])
+@app.get("/")
 def index():
-    return render_template_string(INDEX_HTML, files=DATASTORE, results=None, query=None)
+    query = request.args.get("q")
+    results = None
+    if query is not None:
+        results = search_in_datastore(query)
 
-@app.route("/upload", methods=["POST"])
+    files = [item["filename"] for item in DATASTORE]
+    return render_template_string(INDEX_HTML, query=query, results=results, files=files)
+
+
+@app.post("/upload")
 def upload():
-    files = request.files.getlist("files")
-    if not files:
-        flash("กรุณาเลือกไฟล์ก่อน")
+    f = request.files.get("file")
+    if not f or f.filename == "":
+        flash("ไม่พบไฟล์ที่จะอัปโหลด")
         return redirect(url_for("index"))
 
-    added = 0
-    for f in files:
-        if not f or f.filename == "":
-            continue
-        filename = secure_filename(f.filename)
-        ext = ext_of(filename)
-        if ext not in ALLOWED_EXT:
-            flash(f"ข้ามไฟล์ {filename}: นามสกุลไม่รองรับ")
-            continue
+    filename = secure_filename(f.filename)
+    ext = ext_of(filename)
+    if ext not in ALLOWED_EXT:
+        flash(f"นามสกุลไม่รองรับ: {ext}")
+        return redirect(url_for("index"))
 
-        # ตั้งชื่อกันชนกัน
-        unique = f"{int(time.time()*1000)}_{filename}"
-        path = os.path.join(UPLOAD_DIR, unique)
-        f.save(path)
+    # บันทึกไฟล์ลงดิสก์ (Render ให้ mount disk ได้ ถ้าอยากเก็บรอดดีพลอย)
+    save_path = os.path.join(UPLOAD_DIR, filename)
+    f.save(save_path)
 
+    try:
+        item = load_dataframe_from_file(save_path, filename)
+    except Exception as e:
+        flash(f"โหลดไฟล์ไม่สำเร็จ: {e}")
         try:
-            item = load_dataframe_from_file(path, filename)
-            DATASTORE.append(item)
-            added += 1
-        except Exception as e:
-            flash(f"อ่านไฟล์ {filename} ไม่สำเร็จ: {e}")
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            os.remove(save_path)
+        except Exception:
+            pass
+        return redirect(url_for("index"))
 
-    flash(f"อัปโหลดสำเร็จ {added} ไฟล์")
+    DATASTORE.append(item)
+    flash(f"อัปโหลดแล้ว: {filename} (แถวข้อมูล {len(item['df'])})")
     return redirect(url_for("index"))
 
-@app.route("/search", methods=["POST"])
-def search():
-    q = request.form.get("q", "").strip()
-    if not q:
-      flash("ใส่คำค้นหาก่อนสิ")
-      return redirect(url_for("index"))
 
-    if not DATASTORE:
-      flash("ยังไม่มีไฟล์ให้อวดผล ควรอัปโหลดก่อน")
-      return redirect(url_for("index"))
-
-    results = search_in_datastore(q)
-    return render_template_string(INDEX_HTML, files=DATASTORE, results=results, query=q)
-
-@app.route("/clear", methods=["POST"])
+@app.post("/clear")
 def clear():
     # ล้างรายการในหน่วยความจำ และลบไฟล์ที่อัปโหลด
     for item in DATASTORE:
